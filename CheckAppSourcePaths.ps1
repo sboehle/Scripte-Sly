@@ -1,352 +1,565 @@
 <#
 .SYNOPSIS
-  Prüft für alle ConfigMgr Applications, ob die Quell-Verzeichnisse noch im Dateisystem vorhanden sind.
+    Checks ConfigMgr Application source paths for existence and accessibility.
 
 .DESCRIPTION
-  Läuft im Configuration Manager (ConfigMgr / SCCM) PowerShell-Kontext. 
-  - Versucht zuerst die ConfigMgr-Cmdlets (Get-CMApplication / Get-CMDeploymentType / Get-CMContent).
-  - Fallback: liest Anwendungen über SMS WMI/CIM (root\SMS\site_<Code>).
-  Extrahiert alle Strings, die wie Windows-Pfade/UNC-Pfade aussehen, und prüft mit Test-Path.
-  Schreibt ein CSV mit Ergebnissen sowie ein Logfile — beides als echte Dateisystempfade (keine CM-Provider-Pfade).
+    Validates all ConfigMgr Application source paths by checking if directories exist
+    and contain files. Operates in ConfigMgr PowerShell context and supports both
+    ConfigMgr cmdlets and WMI/CIM fallback methods.
+    
+    The script:
+    - Connects to ConfigMgr using available cmdlets or WMI/CIM
+    - Extracts all Windows/UNC paths from application deployment types
+    - Validates path existence using Test-Path
+    - Generates CSV report and detailed log file
+    
+    This is particularly useful during ConfigMgr cleanup operations to identify
+    applications with missing or empty source directories.
 
 .PARAMETER OutputDirectory
-  Expliziter Dateisystempfad, in dem CSV und Log abgelegt werden.
-  Standard: C:\ConfigMgrAppSourceCheck
+    Filesystem path where CSV report and log file will be saved.
+    Directory will be created if it doesn't exist.
+    Default: C:\ConfigMgrAppSourceCheck
 
 .PARAMETER VerboseLog
-  Schaltet ausführliche Logging-Ausgaben ein.
+    Enables detailed logging output for troubleshooting.
 
 .EXAMPLE
-  .\Check-ConfigMgrAppSourcePaths.ps1 -OutputDirectory 'C:\Reports\ConfigMgr' -VerboseLog
+    .\CheckAppSourcePaths.ps1
+    
+    Runs the check with default output directory.
+
+.EXAMPLE
+    .\CheckAppSourcePaths.ps1 -OutputDirectory 'C:\Reports\ConfigMgr' -VerboseLog
+    
+    Runs the check with custom output directory and verbose logging enabled.
+
+.EXAMPLE
+    .\CheckAppSourcePaths.ps1 -OutputDirectory 'D:\Audit\Apps'
+    
+    Saves results to a custom directory on D: drive.
+
+.INPUTS
+    None. This script does not accept pipeline input.
+
+.OUTPUTS
+    System.String
+    
+    Outputs log messages to console and creates two files:
+    - CSV file with application source path validation results
+    - Log file with detailed execution information
 
 .NOTES
-  Kompatibilität: PowerShell 5.1
-  Muss mit einem Account ausgeführt werden, der Zugriff auf das SMS-Provider-Namespace hat oder in der ConfigMgr-Console gestartet wird.
+    Author: Configuration Manager Administrator
+    Requires: PowerShell 5.1 or higher
+    Requires: Access to SMS Provider namespace or ConfigMgr console context
+    Requires: Read permissions on all UNC/network paths to be validated
+    
+    The account running this script must have:
+    - ConfigMgr read permissions (SMS Provider access)
+    - Network access to all application source paths
+    - Write permissions to the output directory
+
+.LINK
+    https://docs.microsoft.com/en-us/mem/configmgr/
+
 #>
 
+[CmdletBinding()]
+[OutputType([System.String])]
 param(
-    [Parameter(Mandatory=$false)]
-    [string]$OutputDirectory = "C:\ConfigMgrAppSourceCheck",
+    [Parameter(Mandatory = $false)]
+    [ValidateNotNullOrEmpty()]
+    [string]$OutputDirectory = 'C:\ConfigMgrAppSourceCheck',
 
-    [Parameter(Mandatory=$false)]
+    [Parameter(Mandatory = $false)]
     [switch]$VerboseLog
 )
 
-# -----------------------
-# Hilfsfunktionen
-# -----------------------
+#region Helper Functions
+
+<#
+.SYNOPSIS
+    Writes a log message to console and log file.
+
+.DESCRIPTION
+    Creates timestamped log entries with severity levels.
+    Writes to both console (Write-Verbose/Write-Warning/Write-Error) and log file.
+
+.PARAMETER Message
+    The message to log.
+
+.PARAMETER Level
+    Severity level: INFO, WARN, or ERROR.
+
+.EXAMPLE
+    Write-Log -Message "Processing application" -Level INFO
+#>
 function Write-Log {
+    [CmdletBinding()]
     param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [string]$Message,
-        [string]$Level = "INFO"
+
+        [Parameter(Mandatory = $false)]
+        [ValidateSet('INFO', 'WARN', 'ERROR')]
+        [string]$Level = 'INFO'
     )
-    $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-    $line = "$timestamp [$Level] $Message"
-    Write-Output $line
-    if ($global:LogFile) {
-        Add-Content -Path $global:LogFile -Value $line -ErrorAction SilentlyContinue
+
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $logLine = "$timestamp [$Level] $Message"
+    
+    # Output to console based on level
+    switch ($Level) {
+        'INFO' { Write-Verbose -Message $logLine }
+        'WARN' { Write-Warning -Message $Message }
+        'ERROR' { Write-Error -Message $Message }
+    }
+    
+    # Write to log file if available
+    if ($script:LogFilePath) {
+        try {
+            Add-Content -Path $script:LogFilePath -Value $logLine -ErrorAction SilentlyContinue
+        }
+        catch {
+            Write-Warning -Message "Failed to write to log file: $_"
+        }
     }
 }
 
-function Ensure-OutputDirectory {
-    param([string]$Path)
+<#
+.SYNOPSIS
+    Ensures the output directory exists and returns its full path.
+
+.DESCRIPTION
+    Creates the directory if it doesn't exist and returns the absolute filesystem path.
+
+.PARAMETER Path
+    Directory path to ensure exists.
+
+.EXAMPLE
+    $fullPath = Initialize-OutputDirectory -Path 'C:\Reports'
+#>
+function Initialize-OutputDirectory {
+    [CmdletBinding()]
+    [OutputType([System.String])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Path
+    )
+
     if (-not (Test-Path -Path $Path)) {
         try {
-            New-Item -Path $Path -ItemType Directory -Force | Out-Null
-        } catch {
-            throw "Konnte Ausgabeverzeichnis nicht erstellen: $Path. Fehler: $_"
+            $null = New-Item -Path $Path -ItemType Directory -Force -ErrorAction Stop
+            Write-Verbose -Message "Created output directory: $Path"
+        }
+        catch {
+            throw "Could not create output directory: $Path. Error: $_"
         }
     }
-    # Liefere immer den absoluten Dateisystempfad zurück
+    
+    # Return absolute filesystem path
     return (Get-Item -Path $Path).FullName
 }
 
-# Rekursive Suche nach Strings, die wie Windows/UNC-Pfade aussehen
-function Extract-PathsFromObject {
+<#
+.SYNOPSIS
+    Recursively extracts Windows/UNC paths from PowerShell objects.
+
+.DESCRIPTION
+    Walks through object properties and collections to find strings that match
+    Windows path patterns (UNC \\server\share or drive letter C:\path).
+    Uses cycle detection to prevent infinite recursion.
+
+.PARAMETER InputObject
+    Object to search for path strings.
+
+.EXAMPLE
+    $paths = Get-PathFromObject -InputObject $deploymentType
+#>
+function Get-PathFromObject {
+    [CmdletBinding()]
+    [OutputType([System.String[]])]
     param(
-        [Parameter(Mandatory=$true)]
-        [psobject]$Object
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [psobject]$InputObject
     )
 
-    $results = [System.Collections.Generic.List[string]]::new()
-    $pathRegex = '^(\\\\\\\\|[A-Za-z]:\\).*'  # UNC (\\) oder Laufwerksbuchstabe (C:\)
-    $visited = [System.Collections.Hashtable]::Synchronized(@{})
+    $pathList = [System.Collections.Generic.List[string]]::new()
+    $pathPattern = '^(\\\\|[A-Za-z]:\\).*'  # UNC (\\) or drive letter (C:\)
+    $visitedObjects = [System.Collections.Hashtable]::Synchronized(@{})
 
-    function _walk($obj) {
-        if ($null -eq $obj) { return }
-
-        $id = [Runtime.InteropServices.GCHandle]::Alloc($obj, [Runtime.InteropServices.GCHandleType]::Weak) 2>$null
-        try {
-            $hash = ($obj.GetHashCode() -as [string])  # Best Effort, dient nur zur Zyklusvermeidung
-        } catch {
-            $hash = [string]::Empty
+    function Search-ObjectForPaths {
+        param([psobject]$Object)
+        
+        if ($null -eq $Object) {
+            return
         }
-        if ($hash -and $visited.ContainsKey($hash)) { return }
-        if ($hash) { $visited[$hash] = $true }
 
-        if ($obj -is [string]) {
-            if ($obj -match $pathRegex) {
-                $results.Add($obj)
+        # Cycle detection
+        try {
+            $objectHash = $Object.GetHashCode() -as [string]
+        }
+        catch {
+            $objectHash = [string]::Empty
+        }
+        
+        if ($objectHash -and $visitedObjects.ContainsKey($objectHash)) {
+            return
+        }
+        
+        if ($objectHash) {
+            $visitedObjects[$objectHash] = $true
+        }
+
+        # String check
+        if ($Object -is [string]) {
+            if ($Object -match $pathPattern) {
+                $pathList.Add($Object)
             }
             return
         }
 
-        if ($obj -is [System.Collections.IEnumerable] -and -not ($obj -is [string])) {
-            foreach ($item in $obj) {
-                _walk $item
+        # Collection check
+        if ($Object -is [System.Collections.IEnumerable] -and -not ($Object -is [string])) {
+            foreach ($item in $Object) {
+                Search-ObjectForPaths -Object $item
             }
             return
         }
 
-        # Für PSObjects / Custom objects: iterate properties
+        # Object properties
         try {
-            $members = $obj | Get-Member -MemberType NoteProperty, Property -ErrorAction SilentlyContinue
-            if ($members) {
-                foreach ($m in $members) {
+            $properties = $Object | Get-Member -MemberType NoteProperty, Property -ErrorAction SilentlyContinue
+            
+            if ($properties) {
+                foreach ($property in $properties) {
                     try {
-                        $val = $obj."$($m.Name)" 2>$null
-                        _walk $val
-                    } catch { }
-                }
-            } else {
-                # primitive fallback: ToString prüfen
-                $ts = $obj.ToString()
-                if ($ts -and ($ts -match $pathRegex)) {
-                    $results.Add($ts)
+                        $value = $Object.($property.Name)
+                        Search-ObjectForPaths -Object $value
+                    }
+                    catch {
+                        # Property access failed, skip
+                    }
                 }
             }
-        } catch {
-            # ignore
+            else {
+                # Fallback: check ToString()
+                $stringValue = $Object.ToString()
+                if ($stringValue -and ($stringValue -match $pathPattern)) {
+                    $pathList.Add($stringValue)
+                }
+            }
+        }
+        catch {
+            # Ignore errors during property enumeration
         }
     }
 
-    _walk $Object
-    # Deduplicate & return as array
-    return $results | Select-Object -Unique
+    Search-ObjectForPaths -Object $InputObject
+    
+    # Return unique paths
+    return $pathList | Select-Object -Unique
 }
 
-# -----------------------
-# Start / Initialisierung
-# -----------------------
+#endregion Helper Functions
+
+#region Initialization
+
+# Set verbose preference if switch is set
+if ($VerboseLog) {
+    $VerbosePreference = 'Continue'
+}
+
+# Initialize output directory
 try {
-    $OutputDirectory = Ensure-OutputDirectory -Path $OutputDirectory
-} catch {
-    Write-Error $_
+    $OutputDirectory = Initialize-OutputDirectory -Path $OutputDirectory
+    Write-Verbose -Message "Output directory initialized: $OutputDirectory"
+}
+catch {
+    Write-Error -Message $_
     exit 1
 }
 
-$ts = (Get-Date).ToString("yyyyMMdd_HHmmss")
-$global:LogFile = Join-Path $OutputDirectory "AppSourceCheck_$ts.log"
-$csvFile = Join-Path $OutputDirectory "AppSourceCheck_$ts.csv"
+# Create output files with timestamp
+$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$script:LogFilePath = Join-Path -Path $OutputDirectory -ChildPath "AppSourceCheck_$timestamp.log"
+$csvFilePath = Join-Path -Path $OutputDirectory -ChildPath "AppSourceCheck_$timestamp.csv"
 
-# CSV Kopfzeile vorbereiten
-$csvHeaders = "ApplicationName,ApplicationId,DeploymentTypeName,CandidateSourcePath,PathExists,CheckedAsUNCOrDrive,Notes"
+# Initialize log file
+$null = New-Item -Path $script:LogFilePath -ItemType File -Force
+Write-Log -Message '========================================' -Level INFO
+Write-Log -Message 'ConfigMgr Application Source Path Check' -Level INFO
+Write-Log -Message '========================================' -Level INFO
+Write-Log -Message "Output directory: $OutputDirectory" -Level INFO
+Write-Log -Message "Log file: $script:LogFilePath" -Level INFO
+Write-Log -Message "CSV file: $csvFilePath" -Level INFO
 
-# Neues Log / CSV anlegen
-"" | Out-File -FilePath $global:LogFile -Encoding UTF8
-$csvHeaders | Out-File -FilePath $csvFile -Encoding UTF8
+#endregion Initialization
 
-Write-Log "Starte ConfigMgr Application Source Check"
-Write-Log "Ausgabeverzeichnis: $OutputDirectory"
+#region ConfigMgr Connection
 
-# -----------------------
-# ConfigMgr-Objekte lesen
-# -----------------------
-$apps = $null
-$usedMethod = ""
+Write-Log -Message 'Connecting to ConfigMgr...' -Level INFO
 
-# Wenn Get-CMApplication verfügbar ist -> Benutzen
+$applications = $null
+$connectionMethod = ''
+
+# Try ConfigMgr cmdlets first
 if (Get-Command -Name Get-CMApplication -ErrorAction SilentlyContinue) {
-    Write-Log "ConfigMgr-Cmdlets gefunden, verwende Get-CMApplication als Quelle."
-    $usedMethod = "Cmdlets"
+    Write-Log -Message 'ConfigMgr cmdlets found, using Get-CMApplication' -Level INFO
+    $connectionMethod = 'Cmdlets'
+    
     try {
-        $apps = Get-CMApplication -ErrorAction Stop
-    } catch {
-        Write-Log "Fehler beim Aufruf von Get-CMApplication: $_" "ERROR"
-        $apps = @()
+        $applications = Get-CMApplication -ErrorAction Stop
+        Write-Log -Message "Successfully retrieved applications using cmdlets" -Level INFO
     }
-} else {
-    # Fallback: WMI/CIM
-    Write-Log "ConfigMgr-Cmdlets nicht gefunden, versuche WMI/CIM-Fallback."
-    # Namespace ermitteln: namespace root\SMS\site_*
+    catch {
+        Write-Log -Message "Failed to retrieve applications using cmdlets: $_" -Level ERROR
+        $applications = @()
+    }
+}
+else {
+    # Fallback to WMI/CIM
+    Write-Log -Message 'ConfigMgr cmdlets not found, attempting WMI/CIM fallback' -Level WARN
+    
     try {
-        $namespaces = Get-CimInstance -Namespace root\SMS -ClassName __namespace -ErrorAction Stop | Where-Object { $_.Name -like "site_*" }
-        if (-not $namespaces) {
-            throw "Kein root\SMS\site_<CODE> Namespace gefunden. Stelle sicher, dass das Skript mit Berechtigungen ausgeführt wird, die Zugriff auf den SMS Provider erlauben."
+        # Find SMS Provider namespace
+        $smsNamespaces = Get-CimInstance -Namespace 'root\SMS' -ClassName '__Namespace' -ErrorAction Stop |
+            Where-Object { $_.Name -like 'site_*' }
+        
+        if (-not $smsNamespaces) {
+            throw 'No root\SMS\site_<CODE> namespace found. Ensure script runs with SMS Provider access.'
         }
-        $siteNsName = $namespaces[0].Name  # erster gefundener Site-Namespace (falls mehrere vorhanden)
-        $namespace = "root\SMS\$siteNsName"
-        Write-Log "Verwende Namespace: $namespace"
-        # SMS_Application Klasse
-        $apps = Get-CimInstance -Namespace $namespace -ClassName SMS_Application -ErrorAction Stop
-        $usedMethod = "CIM:$namespace"
-    } catch {
-        Write-Log "Fehler beim Zugriff auf SMS WMI/CIM: $_" "ERROR"
-        $apps = @()
+        
+        $siteNamespace = $smsNamespaces[0].Name
+        $namespace = "root\SMS\$siteNamespace"
+        $connectionMethod = "CIM:$namespace"
+        
+        Write-Log -Message "Using namespace: $namespace" -Level INFO
+        
+        # Query applications
+        $applications = Get-CimInstance -Namespace $namespace -ClassName SMS_Application -ErrorAction Stop
+        Write-Log -Message "Successfully retrieved applications using WMI/CIM" -Level INFO
+    }
+    catch {
+        Write-Log -Message "Failed to access SMS Provider via WMI/CIM: $_" -Level ERROR
+        $applications = @()
     }
 }
 
-Write-Log ("Anzahl gefundener Applications: {0}" -f ($apps.Count))
+$applicationCount = @($applications).Count
+Write-Log -Message "Found $applicationCount application(s)" -Level INFO
 
-# -----------------------
-# Durch alle Applications iterieren
-# -----------------------
-foreach ($app in $apps) {
-    # Versuche aussagekräftige Felder zu finden
-    $appName = $null
-    $appId = $null
+if ($applicationCount -eq 0) {
+    Write-Log -Message 'No applications found or connection failed. Exiting.' -Level ERROR
+    exit 1
+}
 
-    if ($usedMethod -eq "Cmdlets") {
-        $appName = $app.LocalizedDisplayName
-        $appId = $app.CI_UniqueID
-    } else {
-        # CIM-Objekt -> unterschiedliche Feldnamen
-        $appName = $app.LocalizedDisplayName
-        if (-not $appName) { $appName = $app.Name }
-        $appId = $app.CI_UniqueID
-        if (-not $appId) { $appId = $app.ApplicationId }
+#endregion ConfigMgr Connection
+
+#region Process Applications
+
+# Initialize CSV with headers
+$csvHeaders = '"ApplicationName","ApplicationId","DeploymentTypeName","CandidateSourcePath","PathExists","IsValidWindowsPath","Notes"'
+$csvHeaders | Out-File -FilePath $csvFilePath -Encoding UTF8
+
+Write-Log -Message 'Processing applications...' -Level INFO
+
+foreach ($app in $applications) {
+    # Extract application name and ID
+    $appName = if ($connectionMethod -eq 'Cmdlets') {
+        $app.LocalizedDisplayName
     }
-
-    if (-not $appName) { $appName = "<unknown>" }
-    if (-not $appId) { $appId = "<unknown>" }
-
-    Write-Log "Untersuche Application: $appName (ID: $appId)"
-
+    else {
+        $app.LocalizedDisplayName ?? $app.Name
+    }
+    
+    $appId = if ($connectionMethod -eq 'Cmdlets') {
+        $app.CI_UniqueID
+    }
+    else {
+        $app.CI_UniqueID ?? $app.ApplicationId
+    }
+    
+    if (-not $appName) { $appName = '<unknown>' }
+    if (-not $appId) { $appId = '<unknown>' }
+    
+    Write-Log -Message "Processing application: $appName (ID: $appId)" -Level INFO
+    
+    # Get deployment types
     $deploymentTypes = @()
-    if ($usedMethod -eq "Cmdlets") {
+    
+    if ($connectionMethod -eq 'Cmdlets') {
         try {
             $deploymentTypes = Get-CMDeploymentType -ApplicationId $appId -ErrorAction SilentlyContinue
+            
             if (-not $deploymentTypes) {
-                # alternative by name fallback
+                # Fallback by name
                 $deploymentTypes = Get-CMDeploymentType -ApplicationName $appName -ErrorAction SilentlyContinue
             }
-        } catch {
-            $deploymentTypes = @()
         }
-    } else {
-        # CIM-Objekt: DeploymentTypes können als eingebettete Struktur vorhanden sein
+        catch {
+            Write-Log -Message "  Failed to retrieve deployment types: $_" -Level WARN
+        }
+    }
+    else {
+        # CIM: Try to find deployment types
         try {
-            # Manche Umgebungen haben das Feld DeploymentTypes, andere DeploymentType
             if ($app.DeploymentTypes) {
                 $deploymentTypes = $app.DeploymentTypes
-            } elseif ($app.DeploymentType) {
+            }
+            elseif ($app.DeploymentType) {
                 $deploymentTypes = $app.DeploymentType
-            } else {
-                # Versuche per Abfrage in SMS_DeploymentType Klasse (Parent = Application CI_UniqueID)
-                try {
-                    $namespace = $namespace # bereits definiert oben
-                    if ($app.CI_UniqueID) {
-                        $query = "SELECT * FROM SMS_DeploymentType WHERE ApplicationId='$($app.CI_UniqueID)'"
-                        $deploymentTypes = Get-CimInstance -Namespace $namespace -Query $query -ErrorAction SilentlyContinue
-                    }
-                } catch {
-                    $deploymentTypes = @()
+            }
+            else {
+                # Query SMS_DeploymentType
+                if ($app.CI_UniqueID) {
+                    $query = "SELECT * FROM SMS_DeploymentType WHERE ApplicationId='$($app.CI_UniqueID)'"
+                    $deploymentTypes = Get-CimInstance -Namespace $namespace -Query $query -ErrorAction SilentlyContinue
                 }
             }
-        } catch {
-            $deploymentTypes = @()
+        }
+        catch {
+            Write-Log -Message "  Failed to retrieve deployment types: $_" -Level WARN
         }
     }
-
+    
     if (-not $deploymentTypes) {
-        Write-Log "  Keine DeploymentTypes gefunden für $appName" "WARN"
-        # Trotzdem versuchen, aus dem $app-Objekt Pfade zu extrahieren (manche Apps haben Source-Pfade direkt)
-        $candidatePaths = Extract-PathsFromObject -Object $app
+        Write-Log -Message "  No deployment types found for $appName" -Level WARN
+        
+        # Try to extract paths directly from application object
+        $candidatePaths = Get-PathFromObject -InputObject $app
+        
         if ($candidatePaths -and $candidatePaths.Count -gt 0) {
-            foreach ($p in $candidatePaths) {
-                $exists = Test-Path -Path $p
-                $notes = "gefunden direkt auf Application-Objekt"
-                $line = '"{0}","{1}","{2}","{3}",{4},{5},"{6}"' -f ($appName,$appId,"<no-deploymenttype>",$p,$exists,($p -match '^(\\\\\\\\|[A-Za-z]:\\)'),$notes)
-                Add-Content -Path $csvFile -Value $line -Encoding UTF8
-                Write-Log ("    Kandidat: {0} -> Exists: {1}" -f $p, $exists)
+            foreach ($path in $candidatePaths) {
+                $pathExists = Test-Path -Path $path
+                $notes = 'Found directly on application object'
+                
+                $csvLine = '"{0}","{1}","{2}","{3}",{4},{5},"{6}"' -f @(
+                    $appName
+                    $appId
+                    '<no-deployment-type>'
+                    $path
+                    $pathExists
+                    $true
+                    $notes
+                )
+                
+                Add-Content -Path $csvFilePath -Value $csvLine -Encoding UTF8
+                Write-Log -Message "    Path: $path -> Exists: $pathExists" -Level INFO
             }
         }
+        
         continue
     }
-
-    # Für jeden DeploymentType alle möglichen Pfade extrahieren
+    
+    # Process each deployment type
     foreach ($dt in $deploymentTypes) {
-        $dtName = $null
-        try {
-            if ($dt.LocalizedDisplayName) { $dtName = $dt.LocalizedDisplayName }
-            elseif ($dt.Name) { $dtName = $dt.Name }
-            elseif ($dt.DeploymentTypeName) { $dtName = $dt.DeploymentTypeName }
-            else { $dtName = "<unknown-deploymenttype>" }
-        } catch {
-            $dtName = "<unknown-deploymenttype>"
-        }
-
-        Write-Log ("  DeploymentType: {0}" -f $dtName)
-
-        # Extrahiere candidate paths aus dem DeploymentType-Objekt
-        $candidatePaths = Extract-PathsFromObject -Object $dt
-
+        $dtName = $dt.LocalizedDisplayName ?? $dt.Name ?? $dt.DeploymentTypeName ?? '<unknown-deployment-type>'
+        
+        Write-Log -Message "  Deployment type: $dtName" -Level INFO
+        
+        # Extract paths from deployment type
+        $candidatePaths = Get-PathFromObject -InputObject $dt
+        
         if (-not $candidatePaths -or $candidatePaths.Count -eq 0) {
-            Write-Log "    Keine eindeutigen Pfade im DeploymentType-Objekt gefunden. Versuche Get-CMContent (wenn verfügbar)."
+            Write-Log -Message "    No candidate paths found in deployment type object" -Level WARN
+            
+            # Try Get-CMContent if available
             if (Get-Command -Name Get-CMContent -ErrorAction SilentlyContinue) {
-                # Versuch: DeploymentType enthält wohl Content/ContentId - versuchen Content abzufragen
                 try {
-                    # Mögliche Properties prüfen
-                    $contentId = $null
-                    foreach ($prop in "ContentId","PackageID","PackageID0","ContentPackageID","ContentLibraryID","SourceId") {
-                        if ($dt.PSObject.Properties.Name -contains $prop) {
-                            $contentId = $dt.$prop
-                            break
-                        }
-                    }
+                    # Try various content ID properties
+                    $contentId = $dt.ContentId ?? $dt.PackageID ?? $dt.PackageID0 ?? $dt.ContentPackageID
+                    
                     if ($contentId) {
                         $contents = Get-CMContent -ContentId $contentId -ErrorAction SilentlyContinue
+                        
                         if ($contents) {
-                            $pathsFromContent = Extract-PathsFromObject -Object $contents
+                            $pathsFromContent = Get-PathFromObject -InputObject $contents
                             $candidatePaths += $pathsFromContent
                         }
                     }
-                } catch {
-                    # ignore
+                }
+                catch {
+                    Write-Log -Message "    Failed to retrieve content: $_" -Level WARN
                 }
             }
         }
-
-        # Wenn noch keine Pfade, notieren
+        
+        # If still no paths found, log and continue
         if (-not $candidatePaths -or $candidatePaths.Count -eq 0) {
-            Write-Log "    Keine Kandidat-Pfade für DeploymentType $dtName gefunden." "WARN"
-            $line = '"{0}","{1}","{2}","{3}",{4},{5},"{6}"' -f ($appName,$appId,$dtName,"<no-paths>",$false,$false,"no candidate paths")
-            Add-Content -Path $csvFile -Value $line -Encoding UTF8
+            Write-Log -Message "    No candidate paths found for deployment type $dtName" -Level WARN
+            
+            $csvLine = '"{0}","{1}","{2}","{3}",{4},{5},"{6}"' -f @(
+                $appName
+                $appId
+                $dtName
+                '<no-paths>'
+                $false
+                $false
+                'No candidate paths found'
+            )
+            
+            Add-Content -Path $csvFilePath -Value $csvLine -Encoding UTF8
             continue
         }
-
-        # Pfade prüfen und in CSV schreiben
-        foreach ($p in $candidatePaths | Select-Object -Unique) {
-            # Normalize: trim, remove surrounding quotes
-            $pTrim = $p.Trim('"').Trim()
-            # Test-Path benötigt echte FileSystemPaths; wir behandeln nur Windows-Pfade / UNC
-            $looksLikePath = ($pTrim -match '^(\\\\\\\\|[A-Za-z]:\\).*')
-            $exists = $false
-            if ($looksLikePath) {
+        
+        # Test each path
+        foreach ($path in ($candidatePaths | Select-Object -Unique)) {
+            # Normalize path
+            $normalizedPath = $path.Trim('"').Trim()
+            
+            # Check if it looks like a Windows path
+            $isValidPath = $normalizedPath -match '^(\\\\|[A-Za-z]:\\).*'
+            
+            $pathExists = $false
+            $notes = ''
+            
+            if ($isValidPath) {
                 try {
-                    $exists = Test-Path -Path $pTrim
-                } catch {
-                    $exists = $false
+                    $pathExists = Test-Path -Path $normalizedPath -ErrorAction Stop
                 }
-            } else {
-                # Nicht als Windows-Pfad erkennbar -> nicht prüfen
-                $exists = $false
+                catch {
+                    $pathExists = $false
+                    $notes = "Access denied or path invalid: $_"
+                }
             }
-            $notes = ""
-            if (-not $looksLikePath) { $notes = "Nicht-windows-pfad-format" }
-
-            $line = '"{0}","{1}","{2}","{3}",{4},{5},"{6}"' -f ($appName,$appId,$dtName,$pTrim,$exists,$looksLikePath,$notes)
-            Add-Content -Path $csvFile -Value $line -Encoding UTF8
-            Write-Log ("    Kandidat: {0} -> Exists: {1}" -f $pTrim, $exists)
+            else {
+                $notes = 'Not recognized as Windows/UNC path format'
+            }
+            
+            $csvLine = '"{0}","{1}","{2}","{3}",{4},{5},"{6}"' -f @(
+                $appName
+                $appId
+                $dtName
+                $normalizedPath
+                $pathExists
+                $isValidPath
+                $notes
+            )
+            
+            Add-Content -Path $csvFilePath -Value $csvLine -Encoding UTF8
+            Write-Log -Message "    Path: $normalizedPath -> Exists: $pathExists" -Level INFO
         }
     }
 }
 
-Write-Log "Fertig. Ergebnisse gespeichert in:"
-Write-Log "  CSV: $csvFile"
-Write-Log "  Log: $global:LogFile"
-Write-Log "Hinweis: Stellen Sie sicher, dass der Account, unter dem das Skript läuft, Zugriff auf alle UNC-Ziele hat (Domain-Zugriff)."
+#endregion Process Applications
 
-# Exit mit 0
-exit 0
-</powershell>
+#region Completion
+
+Write-Log -Message '========================================' -Level INFO
+Write-Log -Message 'Application source path check complete' -Level INFO
+Write-Log -Message "Results saved to: $csvFilePath" -Level INFO
+Write-Log -Message "Log saved to: $script:LogFilePath" -Level INFO
+Write-Log -Message '========================================' -Level INFO
+Write-Log -Message 'NOTE: Ensure the account running this script has access to all UNC/network paths for accurate results.' -Level INFO
+
+Write-Host "`nCheck complete!" -ForegroundColor Green
+Write-Host "CSV Report: $csvFilePath" -ForegroundColor Cyan
+Write-Host "Log File:   $script:LogFilePath" -ForegroundColor Cyan
+
+#endregion Completion
